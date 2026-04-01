@@ -43,6 +43,10 @@ import {
   setZoneLights,
   onBeatEvent,
   offBeatEvent,
+  onBridgeHealth,
+  offBridgeHealth,
+  getDetectedBPM,
+  type BeatSyncMode,
 } from '../lib/beatSync';
 
 /* ---- Icons ---- */
@@ -422,10 +426,16 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
   const [autoHue, setAutoHue] = useState(false);
   const [hueBrightness, setHueBrightness] = useState(70);
   const lastAutoHueArt = useRef('');
-  const [beatSyncOn, setBeatSyncOn] = useState(false);
+  const [beatSyncMode, setBeatSyncMode] = useState<BeatSyncMode | null>(null);
   const [beatSensitivity, setBeatSensitivity] = useState(70);
-  const [beatPulseIntensity, setBeatPulseIntensity] = useState(40);
+  const [beatPulseIntensity, setBeatPulseIntensity] = useState(30);
+  const [beatWaveSpeed, setBeatWaveSpeed] = useState(60);
+  const [waveBaseLevel, setWaveBaseLevel] = useState(40);
+  const [beatResponsiveness, setBeatResponsiveness] = useState(50);
   const [beatFlash, setBeatFlash] = useState(false);
+  const [bridgeAvgMs, setBridgeAvgMs] = useState(0);
+  const [bridgeWarning, setBridgeWarning] = useState(false);
+  const [bridgeCallsPerSec, setBridgeCallsPerSec] = useState(0);
 
   useEffect(() => {
     api.get<Array<{ zone: string; groupId: string; name: string; lights: string[] }>>('/hue/zones')
@@ -542,30 +552,41 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
       setTimeout(() => setBeatFlash(false), 120);
     };
     onBeatEvent(onBeat);
-    return () => { offBeatEvent(onBeat); };
+    const onHealth = (avgMs: number, overloaded: boolean, _callsPerSec?: number) => {
+      setBridgeAvgMs(avgMs);
+      setBridgeWarning(overloaded);
+      if (_callsPerSec !== undefined) setBridgeCallsPerSec(_callsPerSec);
+    };
+    onBridgeHealth(onHealth);
+    return () => { offBeatEvent(onBeat); offBridgeHealth(onHealth); };
   }, []);
 
   // Update beat sync config live when sliders change
   useEffect(() => {
-    if (beatSyncOn) {
-      setBeatSyncConfig({ sensitivity: beatSensitivity, pulseIntensity: beatPulseIntensity, baseBrightness: hueBrightness });
+    if (beatSyncMode) {
+      setBeatSyncConfig({ sensitivity: beatSensitivity, pulseIntensity: beatPulseIntensity, baseBrightness: hueBrightness, waveSpeed: beatWaveSpeed, waveBaseLevel, responsiveness: beatResponsiveness });
     }
-  }, [beatSensitivity, beatPulseIntensity, hueBrightness, beatSyncOn]);
+  }, [beatSensitivity, beatPulseIntensity, hueBrightness, beatSyncMode, beatWaveSpeed, waveBaseLevel, beatResponsiveness]);
 
-  function toggleBeatSync() {
-    if (beatSyncOn) {
+  function activateMode(mode: BeatSyncMode) {
+    if (beatSyncMode === mode) {
       stopBeatSync();
-      setBeatSyncOn(false);
-    } else {
-      const allGroupIds = hueZones.map(z => z.groupId);
-      const ok = startBeatSync({
-        sensitivity: beatSensitivity,
-        zones: allGroupIds,
-        pulseIntensity: beatPulseIntensity,
-        baseBrightness: hueBrightness,
-      });
-      setBeatSyncOn(ok);
+      setBeatSyncMode(null);
+      return;
     }
+    stopBeatSync();
+    const allGroupIds = hueZones.map(z => z.groupId);
+    const ok = startBeatSync({
+      mode,
+      sensitivity: beatSensitivity,
+      zones: allGroupIds,
+      pulseIntensity: beatPulseIntensity,
+      baseBrightness: hueBrightness,
+      waveSpeed: beatWaveSpeed,
+      waveBaseLevel,
+      responsiveness: beatResponsiveness,
+    });
+    setBeatSyncMode(ok ? mode : null);
   }
 
   if (!np) {
@@ -663,47 +684,114 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
                 +
               </button>
             </div>
-            {/* Beat Sync */}
-            <div className="flex items-center gap-2 mt-2">
-              <button
-                onClick={toggleBeatSync}
-                className={`flex-1 h-[44px] rounded-xl text-[14px] font-semibold transition-colors flex items-center justify-center gap-2 ${beatSyncOn ? 'bg-accent-blue/20 text-accent-blue border border-accent-blue/40' : 'bg-surface-700 text-text-muted hover:bg-surface-600'}`}
-              >
-                Beat Sync
-              </button>
-              <div
-                className="w-[12px] h-[12px] rounded-full transition-transform duration-75"
-                style={{
-                  backgroundColor: beatSyncOn ? '#f472b6' : '#374151',
-                  opacity: beatSyncOn ? (beatFlash ? 1 : 0.4) : 0.3,
-                  transform: beatFlash ? 'scale(1.6)' : 'scale(1)',
-                }}
-              />
+            {/* Light Sync Modes */}
+            <div className="mt-2">
+              <div className="flex items-center gap-2">
+                {(['pulse', 'bpm', 'wave', 'cinematic'] as BeatSyncMode[]).map(mode => (
+                  <button
+                    key={mode}
+                    onClick={() => activateMode(mode)}
+                    className={`flex-1 h-[40px] rounded-xl text-[13px] font-semibold transition-colors ${
+                      beatSyncMode === mode
+                        ? mode === 'cinematic' ? 'bg-red-900/40 text-red-400 border border-red-500/40'
+                        : 'bg-accent-blue/20 text-accent-blue border border-accent-blue/40'
+                        : 'bg-surface-700 text-text-muted hover:bg-surface-600'
+                    }`}
+                  >
+                    {mode === 'pulse' ? 'Pulse' : mode === 'bpm' ? 'BPM' : mode === 'wave' ? 'Wave' : 'Cinematic'}
+                  </button>
+                ))}
+                <div
+                  className="w-[12px] h-[12px] rounded-full transition-transform duration-75 flex-shrink-0"
+                  style={{
+                    backgroundColor: beatSyncMode ? (beatSyncMode === 'cinematic' ? '#ef4444' : '#f472b6') : '#374151',
+                    opacity: beatSyncMode ? (beatFlash ? 1 : 0.4) : 0.3,
+                    transform: beatFlash ? 'scale(1.6)' : 'scale(1)',
+                  }}
+                />
+              </div>
+              {beatSyncMode && bridgeWarning && (
+                <div className="mt-1 px-3 py-1 bg-red-900/40 border border-red-500/40 rounded-lg text-red-400 text-[12px] text-center">
+                  Bridge overloaded — {bridgeCallsPerSec} calls/sec, {bridgeAvgMs}ms avg
+                </div>
+              )}
+              {beatSyncMode && !bridgeWarning && bridgeAvgMs > 0 && (
+                <div className="mt-1 text-text-muted text-[11px] text-center">
+                  Bridge: {bridgeCallsPerSec}/sec, {bridgeAvgMs}ms avg
+                </div>
+              )}
             </div>
-            {beatSyncOn && (
+            {(beatSyncMode === 'pulse' || beatSyncMode === 'bpm') && (
               <div className="mt-2 space-y-2 bg-surface-700 rounded-xl p-3">
+                {beatSyncMode === 'bpm' && (
+                  <div className="text-center mb-2">
+                    <span className="text-text-muted text-[12px]">Detected BPM: </span>
+                    <span className="text-accent-blue text-[16px] font-bold">{getDetectedBPM() || '...'}</span>
+                  </div>
+                )}
                 <div>
                   <div className="flex items-center justify-between mb-1">
                     <span className="text-text-muted text-[12px]">Sensitivity</span>
                     <span className="text-text-primary text-[12px] font-bold">{beatSensitivity}%</span>
                   </div>
-                  <input
-                    type="range" min={50} max={100} value={beatSensitivity}
+                  <input type="range" min={30} max={100} value={beatSensitivity}
                     onChange={e => setBeatSensitivity(Number(e.target.value))}
-                    className="w-full h-1.5 rounded-full appearance-none bg-surface-600 accent-accent-blue"
-                  />
+                    className="w-full h-1.5 rounded-full appearance-none bg-surface-600 accent-accent-blue" />
                 </div>
                 <div>
                   <div className="flex items-center justify-between mb-1">
                     <span className="text-text-muted text-[12px]">Pulse Intensity</span>
                     <span className="text-text-primary text-[12px] font-bold">{beatPulseIntensity}%</span>
                   </div>
-                  <input
-                    type="range" min={30} max={50} value={beatPulseIntensity}
+                  <input type="range" min={20} max={100} value={beatPulseIntensity}
                     onChange={e => setBeatPulseIntensity(Number(e.target.value))}
-                    className="w-full h-1.5 rounded-full appearance-none bg-surface-600 accent-accent-blue"
-                  />
+                    className="w-full h-1.5 rounded-full appearance-none bg-surface-600 accent-accent-blue" />
                 </div>
+              </div>
+            )}
+            {beatSyncMode === 'wave' && (
+              <div className="mt-2 space-y-2 bg-surface-700 rounded-xl p-3">
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-text-muted text-[12px]">Wave Speed</span>
+                    <span className="text-text-primary text-[12px] font-bold">{beatWaveSpeed}%</span>
+                  </div>
+                  <input type="range" min={30} max={100} value={beatWaveSpeed}
+                    onChange={e => setBeatWaveSpeed(Number(e.target.value))}
+                    className="w-full h-1.5 rounded-full appearance-none bg-surface-600 accent-accent-blue" />
+                </div>
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-text-muted text-[12px]">Intensity</span>
+                    <span className="text-text-primary text-[12px] font-bold">{beatPulseIntensity}%</span>
+                  </div>
+                  <input type="range" min={20} max={100} value={beatPulseIntensity}
+                    onChange={e => setBeatPulseIntensity(Number(e.target.value))}
+                    className="w-full h-1.5 rounded-full appearance-none bg-surface-600 accent-accent-blue" />
+                </div>
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-text-muted text-[12px]">Base Light Level</span>
+                    <span className="text-text-primary text-[12px] font-bold">{waveBaseLevel}%</span>
+                  </div>
+                  <input type="range" min={0} max={70} value={waveBaseLevel}
+                    onChange={e => setWaveBaseLevel(Number(e.target.value))}
+                    className="w-full h-1.5 rounded-full appearance-none bg-surface-600 accent-accent-blue" />
+                </div>
+              </div>
+            )}
+            {beatSyncMode === 'cinematic' && (
+              <div className="mt-2 space-y-2 bg-surface-700 rounded-xl p-3">
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-text-muted text-[12px]">Responsiveness</span>
+                    <span className="text-text-primary text-[12px] font-bold">{beatResponsiveness}%</span>
+                  </div>
+                  <input type="range" min={30} max={100} value={beatResponsiveness}
+                    onChange={e => setBeatResponsiveness(Number(e.target.value))}
+                    className="w-full h-1.5 rounded-full appearance-none bg-surface-600 accent-red-500" />
+                </div>
+                <p className="text-text-muted text-[11px]">Room breathes with the music. Deep red swells to hot red on crescendos.</p>
               </div>
             )}
           </div>

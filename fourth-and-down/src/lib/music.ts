@@ -148,7 +148,8 @@ export async function initMusicKit(): Promise<boolean> {
       app: { name: 'Fourth & Down', build: '1.0.0' },
     });
     initialized = true;
-    console.log('[MusicKit] Initialized');
+    musicInstance.volume = 0.75;
+    console.log('[MusicKit] Initialized, volume 75%');
 
     // Load ban list on init
     if (!banListLoaded) refreshBanList();
