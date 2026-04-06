@@ -122,6 +122,7 @@ let queuePosition = -1;
 let savedMainPosition = -1;
 let isOverrideActive = false;
 let shuffleToggle = false;
+let advancing = false; // prevents concurrent queue advancement
 let repeatToggle: 'off' | 'one' | 'all' = 'off';
 
 // ─── Init & Auth ────────────────────────────────────────────────────────────
@@ -159,48 +160,21 @@ export async function initMusicKit(): Promise<boolean> {
     musicInstance.addEventListener('nowPlayingItemDidChange', () => {
       emit('nowPlayingChange');
     });
-    // Fallback: poll for song end
-    let lastEndedSongId = '';
-    let lastLoggedState = -1;
-    let lastSongId = '';
-    let stoppedSince = 0;
+    // Poll: is something playing? No? Play the next song.
     setInterval(() => {
-      if (!musicInstance) return;
+      if (!musicInstance || advancing) return;
       const state = musicInstance.playbackState;
       const states = window.MusicKit.PlaybackStates;
-      const songId = musicInstance.nowPlayingItem?.id || '';
-      const duration = musicInstance.nowPlayingItem?.attributes?.durationInMillis || 0;
-      const current = (musicInstance.currentPlaybackTime || 0) * 1000;
-      const isPlaying = state === states.playing;
+      if (state === states.playing || state === states.paused || state === states.loading || state === 1) return;
 
-      // Log state changes for debugging
-      if (state !== lastLoggedState || songId !== lastSongId) {
-        console.log('[MusicKit] State:', state, 'Song:', songId?.substring(0, 15), 'Time:', Math.round(current), '/', duration);
-        lastLoggedState = state;
-        lastSongId = songId;
-      }
+      // Nothing playing. Is there a song to play?
+      const queue = isOverrideActive ? overrideQueue : mainQueue;
+      const pos = isOverrideActive ? overridePosition : queuePosition;
+      if (pos + 1 >= queue.length && repeatToggle !== 'all' && !(isOverrideActive && overrideLoop)) return;
 
-      // Track how long we've been stopped
-      if (isPlaying) {
-        stoppedSince = 0;
-      } else if (stoppedSince === 0 && !isPlaying && songId) {
-        stoppedSince = Date.now();
-      }
-
-      // Detect song end: not playing for 1.5+ seconds, song exists, not already handled
-      if (!isPlaying && songId && songId !== lastEndedSongId && stoppedSince > 0 && Date.now() - stoppedSince > 1500) {
-        // Confirm it's a real end (near end of song, or time reset, or completed state)
-        const nearEnd = duration > 0 && (duration - current < 3000 || current < 500);
-        const isStopped = state === states.completed || state === states.ended ||
-                          state === states.stopped || state === states.none;
-        if (nearEnd || isStopped) {
-          console.log('[MusicKit] Song ended (poll):', songId, 'state:', state);
-          lastEndedSongId = songId;
-          stoppedSince = 0;
-          handleSongEnded();
-        }
-      }
-    }, 500);
+      console.log('[MusicKit] Nothing playing, advancing queue');
+      handleSongEnded();
+    }, 1000);
 
     return true;
   } catch (e) {
@@ -332,13 +306,25 @@ export async function getAlbumTracks(albumId: string): Promise<any[]> {
   }
 }
 
-export async function playSong(songId: string) {
-  if (!musicInstance) return;
+export async function playSong(songId: string): Promise<boolean> {
+  if (!musicInstance) return false;
   try {
     await musicInstance.setQueue({ song: songId });
     await musicInstance.play();
+    // Verify it actually started — check after 2 seconds
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        const state = musicInstance?.playbackState;
+        const playing = state === window.MusicKit?.PlaybackStates?.playing;
+        if (!playing) {
+          console.warn('[MusicKit] playSong failed to start:', songId, 'state:', state);
+        }
+        resolve(playing);
+      }, 2000);
+    });
   } catch (e) {
     console.error('[MusicKit] playSong error:', e);
+    return false;
   }
 }
 
@@ -496,13 +482,16 @@ function handlePlaybackStateChange() {
   // Detect song ended — MusicKit may transition to completed, ended, stopped, or paused at end
   if (lastPlaybackState === states.playing && (
     current === states.completed ||
-    current === states.ended ||
-    current === states.stopped ||
-    current === states.none
+    current === states.ended
   )) {
-    // Verify it's actually a song end, not a user stop
+    console.log('[MusicKit] Song ended (event), state:', current);
+    handleSongEnded();
+  }
+  // Also catch playing → stopped if near end of song
+  if (lastPlaybackState === states.playing && (current === states.stopped || current === states.none)) {
     const remaining = musicInstance.currentPlaybackTimeRemaining;
-    if (remaining === undefined || remaining <= 1) {
+    if (remaining === undefined || remaining === null || remaining <= 2) {
+      console.log('[MusicKit] Song ended (stopped near end), remaining:', remaining);
       handleSongEnded();
     }
   }
@@ -523,18 +512,29 @@ async function handleSongEnded() {
 }
 
 async function playNextInQueue() {
+  if (advancing) return;
+  advancing = true;
+  try {
+    await _playNextInQueueInner();
+  } finally {
+    advancing = false;
+  }
+}
+
+async function _playNextInQueueInner() {
   if (isOverrideActive) {
     overridePosition++;
     if (overridePosition >= overrideQueue.length) {
-      // If main queue has songs waiting, stop override and play them
-      if (mainQueue.length > 0 && savedMainPosition < mainQueue.length - 1) {
+      // If main queue has songs, stop override and play them
+      if (mainQueue.length > 0) {
+        console.log('[MusicKit] Override queue finished, resuming main queue');
         popOverride();
         return;
       }
       if (overrideLoop) {
         overridePosition = 0;
       } else {
-        // Override finished, return to main queue
+        // Override finished, no main queue to return to
         popOverride();
         return;
       }
@@ -542,7 +542,11 @@ async function playNextInQueue() {
     if (overridePosition < overrideQueue.length) {
       const song = overrideQueue[overridePosition];
       emit('queueChange');
-      await playSong(song.songId);
+      const ok = await playSong(song.songId);
+      if (!ok && overridePosition < overrideQueue.length - 1) {
+        console.log('[MusicKit] Override song failed, skipping to next');
+        await playNextInQueue();
+      }
     }
     return;
   }
@@ -574,7 +578,11 @@ async function playNextInQueue() {
   if (queuePosition < mainQueue.length) {
     const song = mainQueue[queuePosition];
     emit('queueChange');
-    await playSong(song.songId);
+    const ok = await playSong(song.songId);
+    if (!ok && queuePosition < mainQueue.length - 1) {
+      console.log('[MusicKit] Song failed, skipping to next');
+      await playNextInQueue();
+    }
   }
 }
 

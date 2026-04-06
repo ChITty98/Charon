@@ -1041,12 +1041,12 @@ export function Darts() {
         {/* Main content: dartboard LEFT, scoreboard CENTER, controls RIGHT */}
         <div className="flex-1 flex min-h-0">
           {/* LEFT: Dartboard area — fixed width, flush left */}
-          <div className="shrink-0 flex items-center justify-center px-2" style={{ width: 'min(50%, 520px)' }}>
+          <div className="shrink-0 flex items-center justify-center px-2" style={{ width: 'min(55%, 650px)' }}>
             <Dartboard
               onDartHit={handleDartHit}
               disabled={dartboardDisabled}
               dartNumber={dartNumber}
-              maxWidth={500}
+              maxWidth={620}
               compact
             />
           </div>

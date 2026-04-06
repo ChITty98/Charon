@@ -97,6 +97,12 @@ export function Settings() {
   const [zoneMappings, setZoneMappings] = useState<Record<string, string>>({});
   const [zoneSaving, setZoneSaving] = useState(false);
 
+  // Entertainment area state
+  interface EntertainmentArea { id: string; name: string; channels: Array<{ id: number; lightId: string }> }
+  const [entertainmentAreas, setEntertainmentAreas] = useState<EntertainmentArea[]>([]);
+  const [selectedEntArea, setSelectedEntArea] = useState(() => localStorage.getItem('charon-ent-area') || '');
+  const [entStatus, setEntStatus] = useState<{ streaming: boolean; areaId: string | null }>({ streaming: false, areaId: null });
+
   // QR code state
   const [showQr, setShowQr] = useState(false);
   const [qrData, setQrData] = useState<{ url: string; qr: string } | null>(null);
@@ -370,6 +376,19 @@ export function Settings() {
     // Load existing zone mappings
     api.get<Record<string, string>>('/zones')
       .then(setZoneMappings)
+      .catch(() => {});
+
+    // Load entertainment areas
+    api.get<EntertainmentArea[]>('/hue/entertainment')
+      .then(setEntertainmentAreas)
+      .catch(() => {});
+
+    // Check entertainment streaming status
+    api.get<{ streaming: boolean; areaId: string | null }>('/hue/entertainment/status')
+      .then((status) => {
+        setEntStatus(status);
+        if (status.areaId) setSelectedEntArea(status.areaId);
+      })
       .catch(() => {});
   }, []);
 
@@ -1539,6 +1558,64 @@ export function Settings() {
           >
             {zoneSaving ? 'Saving...' : 'Save Zone Mappings'}
           </Button>
+        </Card>
+      )}
+
+      {/* Entertainment Streaming — Hue Entertainment API for real-time light sync */}
+      {hueAuthState === 'success' && entertainmentAreas.length > 0 && (
+        <Card className="mb-5">
+          <div className="mb-4">
+            <h2 className="text-[20px] font-bold text-text-primary">Entertainment Streaming</h2>
+            <p className="text-text-muted text-[14px] mt-1">
+              Use the Hue Entertainment API for real-time light sync in Cinematic mode (~25fps via DTLS)
+            </p>
+          </div>
+          <div className="flex items-center gap-3">
+            <select
+              value={selectedEntArea}
+              onChange={(e) => { setSelectedEntArea(e.target.value); localStorage.setItem('charon-ent-area', e.target.value); }}
+              className="flex-1 h-[52px] bg-surface-700 border border-surface-500 rounded-xl px-4 text-text-primary text-[16px] appearance-none cursor-pointer"
+            >
+              <option value="">— Select Entertainment Area —</option>
+              {entertainmentAreas.map(a => (
+                <option key={a.id} value={a.id}>
+                  {a.name} ({a.channels.length} channels)
+                </option>
+              ))}
+            </select>
+            {entStatus.streaming ? (
+              <Button
+                variant="secondary"
+                className="!bg-red-900/40 !text-red-400 !border-red-500/40"
+                onClick={async () => {
+                  await api.post('/hue/entertainment/stop', {});
+                  setEntStatus({ streaming: false, areaId: null });
+                }}
+              >
+                Stop
+              </Button>
+            ) : (
+              <Button
+                variant="primary"
+                disabled={!selectedEntArea}
+                onClick={async () => {
+                  const result = await api.post<{ ok: boolean; error?: string }>('/hue/entertainment/start', { areaId: selectedEntArea });
+                  if (result.ok) {
+                    setEntStatus({ streaming: true, areaId: selectedEntArea });
+                  } else {
+                    alert(result.error || 'Failed to start entertainment streaming');
+                  }
+                }}
+              >
+                Start
+              </Button>
+            )}
+          </div>
+          {entStatus.streaming && (
+            <p className="text-accent-green text-[13px] mt-2">
+              Streaming to entertainment area — Cinematic mode will use DTLS
+            </p>
+          )}
         </Card>
       )}
 

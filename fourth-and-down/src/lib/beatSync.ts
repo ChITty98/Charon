@@ -4,10 +4,13 @@
 // All modes go silent (no dot, no Hue calls) when energy is near-zero
 
 import { api } from './api';
+import { socket } from './socket';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export type BeatSyncMode = 'pulse' | 'bpm' | 'wave' | 'cinematic';
+
+export type FrequencyBand = 'bass' | 'low-mid' | 'mid' | 'full';
 
 export interface BeatSyncConfig {
   mode: BeatSyncMode;
@@ -18,6 +21,8 @@ export interface BeatSyncConfig {
   waveSpeed: number;
   waveBaseLevel: number;
   responsiveness: number;
+  entertainmentChannels?: number;
+  frequencyBand?: FrequencyBand;
 }
 
 type BeatCallback = (energy: number) => void;
@@ -48,7 +53,7 @@ let hueInFlight = false;
 // Pulse state
 const energyHistory: number[] = [];
 const HISTORY_SIZE = 43;
-const MIN_BEAT_INTERVAL = 200;
+const MIN_BEAT_INTERVAL = 350;
 let lastBeatTime = 0;
 let pulseIsDown = false;
 
@@ -70,6 +75,40 @@ let wavePrevLight: string | null = null;
 let cinematicEnergy = 0;
 let lastCinematicUpdate = 0;
 let lastCinematicBrightness = -1;
+
+// Entertainment streaming state
+let entertainmentStreaming = false;
+export function setEntertainmentStreaming(streaming: boolean) { entertainmentStreaming = streaming; }
+
+// Base channel colors — set from album art, used as base for all entertainment modes
+let baseChannelColors: Array<{ r: number; g: number; b: number }> = [];
+export function setBaseChannelColors(colors: Array<{ r: number; g: number; b: number }>) { baseChannelColors = colors; }
+
+// Color cycling — rotates base colors across channels
+let colorCycleEnabled = false;
+let colorCycleOffset = 0;
+let colorCycleInterval: ReturnType<typeof setInterval> | null = null;
+
+export function setColorCycle(enabled: boolean, speedMs?: number) {
+  colorCycleEnabled = enabled;
+  if (colorCycleInterval) { clearInterval(colorCycleInterval); colorCycleInterval = null; }
+  if (enabled && baseChannelColors.length > 1) {
+    const interval = speedMs || 500;
+    colorCycleInterval = setInterval(() => {
+      colorCycleOffset = (colorCycleOffset + 1) % baseChannelColors.length;
+    }, interval);
+  } else {
+    colorCycleOffset = 0;
+  }
+}
+
+function getBaseColor(channelIdx: number): { r: number; g: number; b: number } {
+  if (baseChannelColors.length > 0) {
+    const idx = (channelIdx + colorCycleOffset) % baseChannelColors.length;
+    return baseChannelColors[idx];
+  }
+  return { r: 255, g: 220, b: 180 }; // warm white fallback
+}
 let energyMin = Infinity;
 let energyMax = 0;
 
@@ -144,6 +183,28 @@ function getEnergy(): number {
   let energy = 0;
   for (let i = 0; i < bassEnd; i++) energy += dataArray[i] * dataArray[i];
   return Math.sqrt(energy / bassEnd);
+}
+
+function getEnergyInBand(band: FrequencyBand): number {
+  if (!analyser || !audioContext) return 0;
+  const dataArray = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(dataArray);
+  const binHz = audioContext.sampleRate / analyser.fftSize;
+
+  let startBin: number, endBin: number;
+  switch (band) {
+    case 'bass':    startBin = 0; endBin = Math.floor(250 / binHz); break;
+    case 'low-mid': startBin = Math.floor(250 / binHz); endBin = Math.floor(1000 / binHz); break;
+    case 'mid':     startBin = Math.floor(1000 / binHz); endBin = Math.floor(4000 / binHz); break;
+    case 'full':
+    default:        startBin = 0; endBin = dataArray.length; break;
+  }
+  startBin = Math.max(0, startBin);
+  endBin = Math.max(startBin + 1, Math.min(endBin, dataArray.length));
+
+  let energy = 0;
+  for (let i = startBin; i < endBin; i++) energy += dataArray[i] * dataArray[i];
+  return Math.sqrt(energy / (endBin - startBin));
 }
 
 // ─── Hue ────────────────────────────────────────────────────────────────────
@@ -247,15 +308,45 @@ function detectPulse() {
     emitBeat(energy);
     pulseIsDown = true;
 
-    const pulseBri = Math.max(0, config.baseBrightness - config.pulseIntensity);
-    for (const zoneId of config.zones) hueCall(`/hue/groups/${zoneId}`, { brightness: pulseBri });
-    const restoreId = setTimeout(() => {
-      for (const zoneId of config.zones) hueCall(`/hue/groups/${zoneId}`, { brightness: config.baseBrightness });
-      pulseIsDown = false;
-    }, 100);
-    pendingRestores.push(restoreId);
-    // Safety: force unlock after 300ms
-    const safetyId = setTimeout(() => { pulseIsDown = false; }, 300);
+    if (entertainmentStreaming) {
+      // Entertainment path — dim then fade back using album base colors
+      const fullRatio = config.baseBrightness / 100;
+      const dimRatio = Math.max(0, (config.baseBrightness - config.pulseIntensity) / 100);
+      const midRatio = (dimRatio + fullRatio) / 2;
+      const channelCount = config.entertainmentChannels || 7;
+      const dimColors = Array.from({ length: channelCount }, (_, i) => {
+        const base = getBaseColor(i);
+        return { channel: i, r: Math.round(base.r * dimRatio), g: Math.round(base.g * dimRatio), b: Math.round(base.b * dimRatio) };
+      });
+      socket.emit('entertainment-colors', { colors: dimColors });
+      const midId = setTimeout(() => {
+        const midColors = Array.from({ length: channelCount }, (_, i) => {
+          const base = getBaseColor(i);
+          return { channel: i, r: Math.round(base.r * midRatio), g: Math.round(base.g * midRatio), b: Math.round(base.b * midRatio) };
+        });
+        socket.emit('entertainment-colors', { colors: midColors });
+      }, 120);
+      pendingRestores.push(midId);
+      const restoreId = setTimeout(() => {
+        const fullColors = Array.from({ length: channelCount }, (_, i) => {
+          const base = getBaseColor(i);
+          return { channel: i, r: Math.round(base.r * fullRatio), g: Math.round(base.g * fullRatio), b: Math.round(base.b * fullRatio) };
+        });
+        socket.emit('entertainment-colors', { colors: fullColors });
+        pulseIsDown = false;
+      }, 250);
+      pendingRestores.push(restoreId);
+    } else {
+      const pulseBri = Math.max(0, config.baseBrightness - config.pulseIntensity);
+      for (const zoneId of config.zones) hueCall(`/hue/groups/${zoneId}`, { brightness: pulseBri });
+      const restoreId = setTimeout(() => {
+        for (const zoneId of config.zones) hueCall(`/hue/groups/${zoneId}`, { brightness: config.baseBrightness });
+        pulseIsDown = false;
+      }, 100);
+      pendingRestores.push(restoreId);
+    }
+    // Safety: force unlock after 400ms
+    const safetyId = setTimeout(() => { pulseIsDown = false; }, 400);
     pendingRestores.push(safetyId);
   }
 
@@ -428,12 +519,41 @@ function startBPMPulser() {
 
 function fireBpmPulse(intervalMs: number) {
   emitBeat(detectedBPM);
-  const pulseBri = Math.max(0, config.baseBrightness - config.pulseIntensity);
-  for (const zoneId of config.zones) hueCall(`/hue/groups/${zoneId}`, { brightness: pulseBri });
-  const restoreId = setTimeout(() => {
-    for (const zoneId of config.zones) hueCall(`/hue/groups/${zoneId}`, { brightness: config.baseBrightness });
-  }, Math.min(100, intervalMs * 0.25));
-  pendingRestores.push(restoreId);
+  if (entertainmentStreaming) {
+    const fullRatio = config.baseBrightness / 100;
+    const dimRatio = Math.max(0, (config.baseBrightness - config.pulseIntensity) / 100);
+    const midRatio = (dimRatio + fullRatio) / 2;
+    const channelCount = config.entertainmentChannels || 7;
+    const dimColors = Array.from({ length: channelCount }, (_, i) => {
+      const base = getBaseColor(i);
+      return { channel: i, r: Math.round(base.r * dimRatio), g: Math.round(base.g * dimRatio), b: Math.round(base.b * dimRatio) };
+    });
+    socket.emit('entertainment-colors', { colors: dimColors });
+    const fadeTime = Math.min(200, intervalMs * 0.4);
+    const midId = setTimeout(() => {
+      const midColors = Array.from({ length: channelCount }, (_, i) => {
+        const base = getBaseColor(i);
+        return { channel: i, r: Math.round(base.r * midRatio), g: Math.round(base.g * midRatio), b: Math.round(base.b * midRatio) };
+      });
+      socket.emit('entertainment-colors', { colors: midColors });
+    }, fadeTime * 0.5);
+    pendingRestores.push(midId);
+    const restoreId = setTimeout(() => {
+      const fullColors = Array.from({ length: channelCount }, (_, i) => {
+        const base = getBaseColor(i);
+        return { channel: i, r: Math.round(base.r * fullRatio), g: Math.round(base.g * fullRatio), b: Math.round(base.b * fullRatio) };
+      });
+      socket.emit('entertainment-colors', { colors: fullColors });
+    }, fadeTime);
+    pendingRestores.push(restoreId);
+  } else {
+    const pulseBri = Math.max(0, config.baseBrightness - config.pulseIntensity);
+    for (const zoneId of config.zones) hueCall(`/hue/groups/${zoneId}`, { brightness: pulseBri });
+    const restoreId = setTimeout(() => {
+      for (const zoneId of config.zones) hueCall(`/hue/groups/${zoneId}`, { brightness: config.baseBrightness });
+    }, Math.min(100, intervalMs * 0.25));
+    pendingRestores.push(restoreId);
+  }
 }
 
 // ─── Mode: Wave ─────────────────────────────────────────────────────────────
@@ -445,31 +565,54 @@ function detectWave() {
   if (isSilent(energy)) { animFrameId = requestAnimationFrame(detectWave); return; }
 
   const now = performance.now();
-  const allLights = getAllLights();
   const stepInterval = Math.max(150, 600 - config.waveSpeed * 4.5);
 
-  if (now - lastWaveStep > stepInterval && allLights.length > 0 && !hueInFlight) {
-    lastWaveStep = now;
+  if (entertainmentStreaming) {
+    // Entertainment path — wave across channels
+    const channelCount = config.entertainmentChannels || 7;
+    if (now - lastWaveStep > stepInterval) {
+      lastWaveStep = now;
+      const normalized = Math.min(1, energy / 150);
+      const crestRatio = Math.max(0.04, normalized * (config.baseBrightness / 100));
+      const baseRatio = config.baseBrightness / 100 * (config.waveBaseLevel / 100);
 
-    const normalized = Math.min(1, energy / 150);
-    const crestBri = Math.max(10, Math.round(normalized * config.baseBrightness));
-    const baseBri = Math.max(0, Math.round(config.baseBrightness * (config.waveBaseLevel / 100)));
+      const currentIdx = waveLightIndex % channelCount;
+      emitBeat(energy);
 
-    const currentIdx = waveLightIndex % allLights.length;
-    const currentLight = allLights[currentIdx];
-
-    emitBeat(energy);
-
-    if (wavePrevLight && wavePrevLight !== currentLight) {
-      hueCall(`/hue/lights/${wavePrevLight}`, { brightness: baseBri }).then(() => {
-        hueCall(`/hue/lights/${currentLight}`, { brightness: crestBri });
-      });
-    } else {
-      hueCall(`/hue/lights/${currentLight}`, { brightness: crestBri });
+      // Build per-channel colors — crest on current, base on rest, using album colors
+      const colors: Array<{ channel: number; r: number; g: number; b: number }> = [];
+      for (let i = 0; i < channelCount; i++) {
+        const ratio = i === currentIdx ? crestRatio : baseRatio;
+        const base = getBaseColor(i);
+        colors.push({ channel: i, r: Math.round(base.r * ratio), g: Math.round(base.g * ratio), b: Math.round(base.b * ratio) });
+      }
+      socket.emit('entertainment-colors', { colors });
+      waveLightIndex++;
     }
+  } else {
+    // REST fallback
+    const allLights = getAllLights();
+    if (now - lastWaveStep > stepInterval && allLights.length > 0 && !hueInFlight) {
+      lastWaveStep = now;
+      const normalized = Math.min(1, energy / 150);
+      const crestBri = Math.max(10, Math.round(normalized * config.baseBrightness));
+      const baseBri = Math.max(0, Math.round(config.baseBrightness * (config.waveBaseLevel / 100)));
 
-    wavePrevLight = currentLight;
-    waveLightIndex++;
+      const currentIdx = waveLightIndex % allLights.length;
+      const currentLight = allLights[currentIdx];
+      emitBeat(energy);
+
+      if (wavePrevLight && wavePrevLight !== currentLight) {
+        hueCall(`/hue/lights/${wavePrevLight}`, { brightness: baseBri }).then(() => {
+          hueCall(`/hue/lights/${currentLight}`, { brightness: crestBri });
+        });
+      } else {
+        hueCall(`/hue/lights/${currentLight}`, { brightness: crestBri });
+      }
+
+      wavePrevLight = currentLight;
+      waveLightIndex++;
+    }
   }
 
   animFrameId = requestAnimationFrame(detectWave);
@@ -484,43 +627,70 @@ let cinematicLightIdx = 0;
 function detectCinematic() {
   if (!isActive || activeMode !== 'cinematic') return;
 
-  const energy = getEnergy();
+  // Reconnect if energy has been zero — MusicKit may have swapped audio elements
+  if (!connectAudio()) { animFrameId = requestAnimationFrame(detectCinematic); return; }
+
+  const energy = config.frequencyBand && config.frequencyBand !== 'full'
+    ? getEnergyInBand(config.frequencyBand)
+    : getEnergy();
   if (isSilent(energy)) { animFrameId = requestAnimationFrame(detectCinematic); return; }
 
+  // Track energy range with faster adaptation
   if (energy > 1) {
     energyMax = Math.max(energyMax, energy);
     energyMin = Math.min(energyMin, energy);
-    energyMax *= 0.9995;
-    energyMin = energyMin * 0.9995 + energy * 0.0005;
+    energyMax *= 0.999;
+    energyMin = energyMin * 0.999 + energy * 0.001;
   }
 
-  const alpha = 0.02 + (config.responsiveness / 100) * 0.13;
+  // Smooth energy — lower alpha = smoother swells
+  const alpha = 0.005 + (config.responsiveness / 100) * 0.14;
   cinematicEnergy = cinematicEnergy * (1 - alpha) + energy * alpha;
 
   const range = Math.max(10, energyMax - energyMin);
   const normalized = Math.min(1, Math.max(0, (cinematicEnergy - energyMin) / range));
-  const targetBri = Math.max(5, Math.round(5 + normalized * (config.baseBrightness - 5)));
 
-  const now = performance.now();
-  const briChanged = Math.abs(targetBri - lastCinematicBrightness) >= 2;
-  if (briChanged && !hueInFlight && now - lastCinematicUpdate > 500) {
-    lastCinematicUpdate = now;
-    emitBeat(energy);
-    lastCinematicBrightness = targetBri;
+  // For entertainment: always send at 40ms (matching 25fps DTLS), let alpha control speed
+  // For REST: throttle more aggressively to avoid bridge overload
+  const minInterval = entertainmentStreaming ? 40 : (400 - (config.responsiveness / 100) * 360);
 
-    const xy: [number, number] = [
-      0.675 - normalized * 0.075,
-      0.322 + normalized * 0.028,
-    ];
+  if (entertainmentStreaming) {
+    // Entertainment API path — scale album base colors by energy
+    const now = performance.now();
+    if (lastCinematicUpdate === 0) console.log('[BeatSync] Cinematic: entertainment streaming active, sending via Socket.IO');
+    if (now - lastCinematicUpdate > minInterval) {
+      lastCinematicUpdate = now;
+      emitBeat(energy);
 
-    // Pick 4 lights from zone, cycle through them one call at a time
-    if (cinematicLights.length === 0) {
-      cinematicLights = getAllLights().slice(0, 4);
+      // Floor of 15% so lights never go fully dark during quiet passages
+      const bri = (0.15 + normalized * 0.85) * (config.baseBrightness / 100);
+      const channelCount = config.entertainmentChannels || 7;
+      const colors = Array.from({ length: channelCount }, (_, i) => {
+        const base = getBaseColor(i);
+        return { channel: i, r: Math.round(base.r * bri), g: Math.round(base.g * bri), b: Math.round(base.b * bri) };
+      });
+      socket.emit('entertainment-colors', { colors });
     }
-    if (cinematicLights.length > 0) {
-      const lightId = cinematicLights[cinematicLightIdx % cinematicLights.length];
-      cinematicLightIdx++;
-      hueCall(`/hue/lights/${lightId}`, { brightness: targetBri, xy });
+  } else {
+    // REST API fallback path
+    if (lastCinematicUpdate === 0) console.log('[BeatSync] Cinematic: REST fallback (no entertainment streaming)');
+    const targetBri = Math.max(5, Math.round(5 + normalized * (config.baseBrightness - 5)));
+    const now = performance.now();
+    const briChanged = Math.abs(targetBri - lastCinematicBrightness) >= 1;
+    if (briChanged && !hueInFlight && now - lastCinematicUpdate > 200) {
+      lastCinematicUpdate = now;
+      emitBeat(energy);
+      lastCinematicBrightness = targetBri;
+
+      const xy: [number, number] = [
+        0.675 - normalized * 0.075,
+        0.322 + normalized * 0.028,
+      ];
+
+      // Set all zone lights at once via group endpoint
+      for (const zoneId of config.zones) {
+        hueCall(`/hue/groups/${zoneId}`, { brightness: targetBri, xy });
+      }
     }
   }
 
@@ -610,6 +780,8 @@ export function stopBeatSync(): void {
   cinematicLightIdx = 0;
   hueResponseTimes.length = 0;
   bridgeOverloaded = false;
+  if (colorCycleInterval) { clearInterval(colorCycleInterval); colorCycleInterval = null; }
+  colorCycleOffset = 0;
   console.log('[BeatSync] Stopped');
 }
 

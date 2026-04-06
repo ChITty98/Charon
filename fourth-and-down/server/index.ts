@@ -1,3 +1,6 @@
+// Allow HTTPS calls to Hue bridge self-signed cert (CLIP v2 API)
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';

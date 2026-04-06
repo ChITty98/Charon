@@ -127,6 +127,9 @@ export class HueBridge {
     this.token = token;
   }
 
+  getIp(): string { return this.ip; }
+  getToken(): string { return this.token; }
+
   private get baseUrl() {
     return `http://${this.ip}/api/${this.token}`;
   }
@@ -156,16 +159,19 @@ export class HueBridge {
     return null;
   }
 
-  static async authenticate(ip: string): Promise<string | null> {
+  static async authenticate(ip: string): Promise<{ username: string; clientkey: string } | null> {
     try {
       const res = await fetch(`http://${ip}/api`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ devicetype: 'fourth-and-down#surface' }),
+        body: JSON.stringify({ devicetype: 'fourth-and-down#surface', generateclientkey: true }),
       });
       const data = await res.json();
       if (Array.isArray(data) && data[0]?.success?.username) {
-        return data[0].success.username;
+        return {
+          username: data[0].success.username,
+          clientkey: data[0].success.clientkey || '',
+        };
       }
       // Link button not pressed — data[0].error.type === 101
       return null;
@@ -243,6 +249,61 @@ export class HueBridge {
   async setAllLights(state: { on?: boolean; bri?: number; xy?: [number, number]; transitiontime?: number }): Promise<void> {
     // Group 0 is always "all lights"
     await this.setGroupState('0', state);
+  }
+
+  // Entertainment API — fetch entertainment configurations
+  async getEntertainmentAreas(): Promise<Array<{ id: string; name: string; channels: Array<{ id: number; lightId: string }> }>> {
+    // Use CLIP v2 API for entertainment configs
+    const res = await fetch(`https://${this.ip}/clip/v2/resource/entertainment_configuration`, {
+      headers: { 'hue-application-key': this.token },
+      // Bridge uses self-signed cert
+      ...(typeof process !== 'undefined' ? {} : {}),
+    });
+    const data = await res.json();
+    if (!data.data) return [];
+    return data.data.map((area: any) => ({
+      id: area.id,
+      name: area.metadata?.name || area.name || 'Unknown',
+      channels: (area.channels || []).map((ch: any) => ({
+        id: ch.channel_id,
+        lightId: ch.members?.[0]?.service?.rid || '',
+      })),
+    }));
+  }
+
+  // Activate entertainment area for streaming
+  async activateEntertainment(areaId: string): Promise<boolean> {
+    try {
+      const res = await fetch(`https://${this.ip}/clip/v2/resource/entertainment_configuration/${areaId}`, {
+        method: 'PUT',
+        headers: {
+          'hue-application-key': this.token,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ action: 'start' }),
+      });
+      const data = await res.json();
+      return !data.errors?.length;
+    } catch (e) {
+      console.error('[Hue] Entertainment activate failed:', e);
+      return false;
+    }
+  }
+
+  // Deactivate entertainment area
+  async deactivateEntertainment(areaId: string): Promise<void> {
+    try {
+      await fetch(`https://${this.ip}/clip/v2/resource/entertainment_configuration/${areaId}`, {
+        method: 'PUT',
+        headers: {
+          'hue-application-key': this.token,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ action: 'stop' }),
+      });
+    } catch (e) {
+      console.error('[Hue] Entertainment deactivate failed:', e);
+    }
   }
 }
 

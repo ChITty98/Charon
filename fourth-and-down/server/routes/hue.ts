@@ -1,5 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { getHueBridge, setHueBridge, HueBridge, rgbToXY } from '../devices/hue.js';
+import { startEntertainment, stopEntertainment, isStreaming, getActiveAreaId, getChannelCount } from '../devices/hueEntertainment.js';
+import db from '../db.js';
 
 const router = Router();
 
@@ -20,11 +22,16 @@ router.post('/api/hue/auth', async (req: Request, res: Response) => {
     if (!ip) {
       return res.status(400).json({ error: 'ip is required' });
     }
-    const token = await HueBridge.authenticate(ip);
-    if (token) {
-      const bridge = new HueBridge(ip, token);
-      setHueBridge(bridge);
-      res.json({ token });
+    const result = await HueBridge.authenticate(ip);
+    if (result) {
+      setHueBridge(ip, result.username);
+      // Store clientkey in extra_config for entertainment API
+      const extraConfig = JSON.stringify({ clientkey: result.clientkey });
+      db.prepare("DELETE FROM device_config WHERE device_type = 'hue'").run();
+      db.prepare("INSERT INTO device_config (device_type, name, ip, auth_token, extra_config) VALUES (?, ?, ?, ?, ?)").run(
+        'hue', 'Hue Bridge', ip, result.username, extraConfig
+      );
+      res.json({ token: result.username, clientkey: result.clientkey });
     } else {
       res.json({ error: 'press_button' });
     }
@@ -133,6 +140,64 @@ router.put('/api/hue/all', async (req: Request, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Get entertainment areas
+router.get('/api/hue/entertainment', async (_req: Request, res: Response) => {
+  try {
+    const bridge = getHueBridge();
+    if (!bridge) {
+      return res.status(400).json({ error: 'Hue bridge not connected' });
+    }
+    const areas = await bridge.getEntertainmentAreas();
+    res.json(areas);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get stored clientkey
+router.get('/api/hue/clientkey', async (_req: Request, res: Response) => {
+  try {
+    const row = db.prepare(
+      "SELECT extra_config FROM device_config WHERE device_type = 'hue' LIMIT 1"
+    ).get() as { extra_config: string } | undefined;
+    if (row?.extra_config) {
+      const config = JSON.parse(row.extra_config);
+      res.json({ clientkey: config.clientkey || null });
+    } else {
+      res.json({ clientkey: null });
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Start entertainment streaming
+router.post('/api/hue/entertainment/start', async (req: Request, res: Response) => {
+  try {
+    const { areaId } = req.body;
+    if (!areaId) return res.status(400).json({ error: 'areaId is required' });
+    const result = await startEntertainment(areaId);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Stop entertainment streaming
+router.post('/api/hue/entertainment/stop', async (_req: Request, res: Response) => {
+  try {
+    await stopEntertainment();
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Check entertainment status
+router.get('/api/hue/entertainment/status', (_req: Request, res: Response) => {
+  res.json({ streaming: isStreaming(), areaId: getActiveAreaId(), channelCount: getChannelCount() });
 });
 
 export default router;

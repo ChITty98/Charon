@@ -40,6 +40,9 @@ import {
   stopBeatSync,
   isBeatSyncActive,
   setBeatSyncConfig,
+  setEntertainmentStreaming,
+  setBaseChannelColors,
+  setColorCycle,
   setZoneLights,
   onBeatEvent,
   offBeatEvent,
@@ -47,7 +50,9 @@ import {
   offBridgeHealth,
   getDetectedBPM,
   type BeatSyncMode,
+  type FrequencyBand,
 } from '../lib/beatSync';
+import { socket } from '../lib/socket';
 
 /* ---- Icons ---- */
 
@@ -427,11 +432,14 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
   const [hueBrightness, setHueBrightness] = useState(70);
   const lastAutoHueArt = useRef('');
   const [beatSyncMode, setBeatSyncMode] = useState<BeatSyncMode | null>(null);
-  const [beatSensitivity, setBeatSensitivity] = useState(70);
-  const [beatPulseIntensity, setBeatPulseIntensity] = useState(30);
+  const [entStreaming, setEntStreaming] = useState(false);
+  const [beatSensitivity, setBeatSensitivity] = useState(85);
+  const [beatPulseIntensity, setBeatPulseIntensity] = useState(15);
   const [beatWaveSpeed, setBeatWaveSpeed] = useState(60);
   const [waveBaseLevel, setWaveBaseLevel] = useState(40);
   const [beatResponsiveness, setBeatResponsiveness] = useState(50);
+  const [frequencyBand, setFrequencyBand] = useState<FrequencyBand>('bass');
+  const [colorCycling, setColorCycling] = useState(false);
   const [beatFlash, setBeatFlash] = useState(false);
   const [bridgeAvgMs, setBridgeAvgMs] = useState(0);
   const [bridgeWarning, setBridgeWarning] = useState(false);
@@ -440,16 +448,18 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
   useEffect(() => {
     api.get<Array<{ zone: string; groupId: string; name: string; lights: string[] }>>('/hue/zones')
       .then(setHueZones).catch(() => {});
+    api.get<{ streaming: boolean }>('/hue/entertainment/status')
+      .then(s => setEntStreaming(s.streaming)).catch(() => {});
   }, []);
 
   // Auto-update lights when song changes
   useEffect(() => {
-    if (!autoHue || !np?.artworkUrl || np.artworkUrl === lastAutoHueArt.current || hueZones.length === 0) return;
+    if (!autoHue || !np?.artworkUrl || np.artworkUrl === lastAutoHueArt.current || (hueZones.length === 0 && !entStreaming)) return;
     lastAutoHueArt.current = np.artworkUrl;
     applyAlbumColors('all');
   }, [autoHue, np?.artworkUrl]);
 
-  async function extractDominantColors(imageUrl: string): Promise<Array<[number, number]>> {
+  async function extractDominantColors(imageUrl: string): Promise<Array<{ rgb: { r: number; g: number; b: number }; xy: [number, number] }>> {
     return new Promise((resolve) => {
       const img = new Image();
       img.crossOrigin = 'anonymous';
@@ -472,7 +482,7 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
         }
         const sorted = Object.values(buckets).sort((a, b) => b.count - a.count).slice(0, 8);
         const colors = sorted.map(b => {
-          const r = b.r / b.count, g = b.g / b.count, bl = b.b / b.count;
+          const r = Math.round(b.r / b.count), g = Math.round(b.g / b.count), bl = Math.round(b.b / b.count);
           // RGB to CIE xy
           let R = r / 255, G = g / 255, B = bl / 255;
           R = R > 0.04045 ? Math.pow((R + 0.055) / 1.055, 2.4) : R / 12.92;
@@ -482,20 +492,73 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
           const Y = R * 0.283881 + G * 0.668433 + B * 0.047685;
           const Z = R * 0.000088 + G * 0.072310 + B * 0.986039;
           const sum = X + Y + Z;
-          return sum === 0 ? [0.3127, 0.3290] as [number, number] : [X / sum, Y / sum] as [number, number];
+          const xy: [number, number] = sum === 0 ? [0.3127, 0.3290] : [X / sum, Y / sum];
+          return { rgb: { r, g, b: bl }, xy };
         });
-        resolve(colors.length > 0 ? colors : [[0.3127, 0.3290]]);
+        resolve(colors.length > 0 ? colors : [{ rgb: { r: 200, g: 200, b: 200 }, xy: [0.3127, 0.3290] }]);
       };
-      img.onerror = () => resolve([[0.3127, 0.3290]]);
+      img.onerror = () => resolve([{ rgb: { r: 200, g: 200, b: 200 }, xy: [0.3127, 0.3290] }]);
       img.src = imageUrl.replace(/\d+x\d+/, '100x100');
     });
+  }
+
+  async function ensureEntertainmentStreaming(): Promise<{ streaming: boolean; channelCount: number }> {
+    // Check if already streaming
+    try {
+      const status = await api.get<{ streaming: boolean; channelCount: number }>('/hue/entertainment/status');
+      if (status.streaming && status.channelCount > 0) {
+        setEntStreaming(true);
+        return status;
+      }
+    } catch { /* continue */ }
+    // Auto-start with saved area
+    const savedArea = localStorage.getItem('charon-ent-area');
+    if (savedArea) {
+      try {
+        const result = await api.post<{ ok: boolean }>('/hue/entertainment/start', { areaId: savedArea });
+        if (result.ok) {
+          const status = await api.get<{ streaming: boolean; channelCount: number }>('/hue/entertainment/status');
+          if (status.streaming) {
+            setEntStreaming(true);
+            return status;
+          }
+        }
+      } catch { /* fall through */ }
+    }
+    return { streaming: false, channelCount: 0 };
   }
 
   async function applyAlbumColors(target: string) {
     if (!np?.artworkUrl) return;
     const colors = await extractDominantColors(np.artworkUrl);
 
-    // Collect all lights from target zones
+    // Entertainment API path — auto-start if needed, send RGB colors to DTLS channels
+    const savedArea = localStorage.getItem('charon-ent-area');
+    if (entStreaming || savedArea) {
+      const status = await ensureEntertainmentStreaming();
+      if (status.streaming && status.channelCount > 0) {
+        // Shuffle color order for variety on each press
+        const shuffled = [...colors];
+        for (let i = shuffled.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+        }
+        const channelColors: Array<{ channel: number; r: number; g: number; b: number }> = [];
+        for (let i = 0; i < status.channelCount; i++) {
+          const c = shuffled[i % shuffled.length].rgb;
+          channelColors.push({ channel: i, r: c.r, g: c.g, b: c.b });
+        }
+        socket.emit('entertainment-colors', { colors: channelColors });
+        // Store as base colors for beat sync modes to use
+        setBaseChannelColors(channelColors.map(c => ({ r: c.r, g: c.g, b: c.b })));
+        setHueConfirmation('Colors set!');
+        setShowRoomPicker(false);
+        setTimeout(() => setHueConfirmation(''), 2000);
+        return;
+      }
+    }
+
+    // REST API fallback — set individual lights via zone mappings
     const targetZones = target === 'all' ? hueZones : hueZones.filter(z => z.groupId === target);
     const allLights: string[] = [];
     for (const zone of targetZones) {
@@ -511,11 +574,9 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
       [shuffledLights[i], shuffledLights[j]] = [shuffledLights[j], shuffledLights[i]];
     }
 
-    // Spread colors across individual lights
     for (let i = 0; i < shuffledLights.length; i++) {
       const colorIdx = i % colors.length;
-      api.put(`/hue/lights/${shuffledLights[i]}`, { on: true, brightness: hueBrightness, xy: colors[colorIdx] }).catch(() => {});
-      // Small delay to avoid overwhelming the Hue bridge (rate limited)
+      api.put(`/hue/lights/${shuffledLights[i]}`, { on: true, brightness: hueBrightness, xy: colors[colorIdx].xy }).catch(() => {});
       if (i < shuffledLights.length - 1) {
         await new Promise(r => setTimeout(r, 50));
       }
@@ -564,17 +625,32 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
   // Update beat sync config live when sliders change
   useEffect(() => {
     if (beatSyncMode) {
-      setBeatSyncConfig({ sensitivity: beatSensitivity, pulseIntensity: beatPulseIntensity, baseBrightness: hueBrightness, waveSpeed: beatWaveSpeed, waveBaseLevel, responsiveness: beatResponsiveness });
+      setBeatSyncConfig({ sensitivity: beatSensitivity, pulseIntensity: beatPulseIntensity, baseBrightness: hueBrightness, waveSpeed: beatWaveSpeed, waveBaseLevel, responsiveness: beatResponsiveness, frequencyBand });
     }
-  }, [beatSensitivity, beatPulseIntensity, hueBrightness, beatSyncMode, beatWaveSpeed, waveBaseLevel, beatResponsiveness]);
+  }, [beatSensitivity, beatPulseIntensity, hueBrightness, beatSyncMode, beatWaveSpeed, waveBaseLevel, beatResponsiveness, frequencyBand]);
 
-  function activateMode(mode: BeatSyncMode) {
+  async function activateMode(mode: BeatSyncMode) {
     if (beatSyncMode === mode) {
       stopBeatSync();
+      setEntertainmentStreaming(false);
+      setColorCycling(false);
+      // Auto-stop entertainment streaming
+      try { await api.post('/hue/entertainment/stop', {}); } catch { /* */ }
+      setEntStreaming(false);
       setBeatSyncMode(null);
       return;
     }
     stopBeatSync();
+
+    // Auto-start entertainment streaming
+    const entStatus = await ensureEntertainmentStreaming();
+    let channelCount = entStatus.channelCount;
+    if (entStatus.streaming) {
+      setEntertainmentStreaming(true);
+    } else {
+      setEntertainmentStreaming(false);
+    }
+
     const allGroupIds = hueZones.map(z => z.groupId);
     const ok = startBeatSync({
       mode,
@@ -585,6 +661,8 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
       waveSpeed: beatWaveSpeed,
       waveBaseLevel,
       responsiveness: beatResponsiveness,
+      entertainmentChannels: channelCount,
+      frequencyBand,
     });
     setBeatSyncMode(ok ? mode : null);
   }
@@ -616,7 +694,7 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
         )}
 
         {/* Room Colors — under album art */}
-        {hueZones.length > 0 && (
+        {(hueZones.length > 0 || entStreaming || !!localStorage.getItem('charon-ent-area')) && (
           <div className="mt-3 w-full">
             {hueConfirmation && (
               <p className="text-green-400 text-[14px] text-center mb-2 font-semibold">{hueConfirmation}</p>
@@ -633,7 +711,7 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
                 className="h-[44px] px-3 rounded-xl text-[13px] font-semibold bg-surface-700 text-text-muted hover:bg-surface-600 transition-colors"
                 title="Resample colors and shuffle light assignments"
               >
-                🔄
+                🎨
               </button>
               <button
                 onClick={() => setAutoHue(!autoHue)}
@@ -687,9 +765,15 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
             {/* Light Sync Modes */}
             <div className="mt-2">
               <div className="flex items-center gap-2">
-                {(['pulse', 'bpm', 'wave', 'cinematic'] as BeatSyncMode[]).map(mode => (
+                {(['pulse', 'bpm', 'wave', 'cinematic'] as BeatSyncMode[]).map(mode => {
+                  const tooltip = mode === 'pulse' ? 'Flash all lights on each beat'
+                    : mode === 'bpm' ? 'Lock to detected BPM tempo'
+                    : mode === 'wave' ? 'Sweep a brightness crest across lights one by one'
+                    : 'Slow mood breathing with warm/cool color shifts';
+                  return (
                   <button
                     key={mode}
+                    title={tooltip}
                     onClick={() => activateMode(mode)}
                     className={`flex-1 h-[40px] rounded-xl text-[13px] font-semibold transition-colors ${
                       beatSyncMode === mode
@@ -700,7 +784,8 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
                   >
                     {mode === 'pulse' ? 'Pulse' : mode === 'bpm' ? 'BPM' : mode === 'wave' ? 'Wave' : 'Cinematic'}
                   </button>
-                ))}
+                  );
+                })}
                 <div
                   className="w-[12px] h-[12px] rounded-full transition-transform duration-75 flex-shrink-0"
                   style={{
@@ -721,6 +806,38 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
                 </div>
               )}
             </div>
+            {beatSyncMode && (
+              <div className="mt-2 flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    const next = !colorCycling;
+                    setColorCycling(next);
+                    // Speed: wave speed slider maps to 800ms (slow) → 150ms (fast)
+                    const speedMs = Math.round(800 - (beatWaveSpeed / 100) * 650);
+                    setColorCycle(next, speedMs);
+                  }}
+                  className={`flex-1 h-[36px] rounded-xl text-[13px] font-semibold transition-colors ${colorCycling ? 'bg-purple-500/20 text-purple-400 border border-purple-500/40' : 'bg-surface-700 text-text-muted hover:bg-surface-600'}`}
+                >
+                  {colorCycling ? '🔄 Cycling Colors' : '🔄 Cycle Colors'}
+                </button>
+                {colorCycling && (
+                  <div className="flex-1">
+                    <div className="flex items-center justify-between mb-0.5">
+                      <span className="text-text-muted text-[11px]">Speed</span>
+                      <span className="text-text-primary text-[11px] font-bold">{beatWaveSpeed}%</span>
+                    </div>
+                    <input type="range" min={10} max={100} value={beatWaveSpeed}
+                      onChange={e => {
+                        const val = Number(e.target.value);
+                        setBeatWaveSpeed(val);
+                        const speedMs = Math.round(800 - (val / 100) * 650);
+                        setColorCycle(true, speedMs);
+                      }}
+                      className="w-full h-1.5 rounded-full appearance-none bg-surface-600 accent-purple-500" />
+                  </div>
+                )}
+              </div>
+            )}
             {(beatSyncMode === 'pulse' || beatSyncMode === 'bpm') && (
               <div className="mt-2 space-y-2 bg-surface-700 rounded-xl p-3">
                 {beatSyncMode === 'bpm' && (
@@ -743,7 +860,7 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
                     <span className="text-text-muted text-[12px]">Pulse Intensity</span>
                     <span className="text-text-primary text-[12px] font-bold">{beatPulseIntensity}%</span>
                   </div>
-                  <input type="range" min={20} max={100} value={beatPulseIntensity}
+                  <input type="range" min={5} max={100} value={beatPulseIntensity}
                     onChange={e => setBeatPulseIntensity(Number(e.target.value))}
                     className="w-full h-1.5 rounded-full appearance-none bg-surface-600 accent-accent-blue" />
                 </div>
@@ -765,7 +882,7 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
                     <span className="text-text-muted text-[12px]">Intensity</span>
                     <span className="text-text-primary text-[12px] font-bold">{beatPulseIntensity}%</span>
                   </div>
-                  <input type="range" min={20} max={100} value={beatPulseIntensity}
+                  <input type="range" min={5} max={100} value={beatPulseIntensity}
                     onChange={e => setBeatPulseIntensity(Number(e.target.value))}
                     className="w-full h-1.5 rounded-full appearance-none bg-surface-600 accent-accent-blue" />
                 </div>
@@ -787,11 +904,22 @@ function NowPlayingTab({ queueState, isAdmin }: { queueState: QueueState | null;
                     <span className="text-text-muted text-[12px]">Responsiveness</span>
                     <span className="text-text-primary text-[12px] font-bold">{beatResponsiveness}%</span>
                   </div>
-                  <input type="range" min={30} max={100} value={beatResponsiveness}
+                  <input type="range" min={5} max={100} value={beatResponsiveness}
                     onChange={e => setBeatResponsiveness(Number(e.target.value))}
                     className="w-full h-1.5 rounded-full appearance-none bg-surface-600 accent-red-500" />
                 </div>
-                <p className="text-text-muted text-[11px]">Room breathes with the music. Deep red swells to hot red on crescendos.</p>
+                <div>
+                  <span className="text-text-muted text-[12px]">Frequency Band</span>
+                  <div className="flex gap-1 mt-1">
+                    {(['bass', 'low-mid', 'mid', 'full'] as FrequencyBand[]).map(band => (
+                      <button key={band} onClick={() => setFrequencyBand(band)}
+                        className={`flex-1 px-2 py-1 rounded-lg text-[11px] font-semibold transition-colors ${frequencyBand === band ? 'bg-red-500/30 text-red-400 border border-red-500/40' : 'bg-surface-600 text-text-muted hover:bg-surface-500'}`}>
+                        {band === 'bass' ? 'Bass' : band === 'low-mid' ? 'Low-Mid' : band === 'mid' ? 'Mid' : 'Full'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <p className="text-text-muted text-[11px]">Room breathes with the music. Select frequency band to control what cinematic responds to.</p>
               </div>
             )}
           </div>
